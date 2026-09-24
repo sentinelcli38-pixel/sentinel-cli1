@@ -1,54 +1,196 @@
+import json
+import re
+import tempfile
+import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from sentinel.analyzers.parsers import (
+    parse_mythril,
+    parse_slither,
+    rank_and_deduplicate,
+)
 from sentinel.runner import ControlledRunner
-from sentinel.schemas.execution import ExecutionResult
+from sentinel.schemas.analysis import AnalyzerRun
 from sentinel.schemas.vulnerability import VulnerabilityFinding
 
 
-def _unavailable(tool: str, project: Path) -> ExecutionResult:
-    return ExecutionResult.failed([tool], str(project), f"{tool} is not installed or unavailable")
+@dataclass
+class AnalysisBundle:
+    runs: list[AnalyzerRun] = field(default_factory=list)
+    findings: list[VulnerabilityFinding] = field(default_factory=list)
 
 
-def run_static_tools(project: Path, runner: ControlledRunner) -> tuple[ExecutionResult, ExecutionResult, list[VulnerabilityFinding]]:
-    results: list[ExecutionResult] = []
-    for command in (("slither", ".", "--json", "-"), ("aderyn", "--root", str(project))):
-        try:
-            result = runner.run(command, project)
-        except (FileNotFoundError, OSError):
-            result = _unavailable(command[0], project)
-        results.append(result)
+def project_sources(project: Path) -> tuple[list[Path], dict]:
+    project = project.resolve()
+    config = tomllib.loads((project / "foundry.toml").read_text(encoding="utf-8"))
+    profile = config.get("profile", {}).get("default", {})
+    root = (project / profile.get("src", "src")).resolve()
+    if root != project and project not in root.parents:
+        raise ValueError("Foundry source directory escapes project")
+    paths = sorted(root.rglob("*.sol")) if root.is_dir() else []
+    for path in paths:
+        if project not in path.resolve().parents:
+            raise ValueError(f"Source symlink escapes project: {path.name}")
+    return paths, profile
 
-    findings: list[VulnerabilityFinding] = []
-    for result in results:
-        if result.success:
-            findings.append(VulnerabilityFinding(
-                id=f"{result.command[0]}-review",
-                source=result.command[0], detector="tool-output",
-                description=f"{result.command[0]} produced analyzable output; parser enrichment required.",
-                raw_output=result.stdout,
+
+def _analyze(tool: str, target: str, command: list[str], project: Path,
+             runner: ControlledRunner, parser, env: dict[str, str] | None = None) -> tuple[AnalyzerRun, list[VulnerabilityFinding]]:
+    execution = runner.run(command, project, env=env)
+    if execution.timed_out:
+        return AnalyzerRun(tool=tool, target=target, status="timed_out", execution=execution,
+                           diagnostics=["Analysis exceeded its process time limit; coverage is incomplete"]), []
+    if execution.exit_code == -1:
+        return AnalyzerRun(tool=tool, target=target, status="unavailable", execution=execution,
+                           diagnostics=[execution.stderr]), []
+    try:
+        document = json.loads(execution.stdout)
+        if isinstance(document, dict) and document.get("success") is False:
+            detail = document.get("error")
+            return AnalyzerRun(
+                tool=tool, target=target, status="failed", execution=execution,
+                diagnostics=[detail if isinstance(detail, str) else "Analyzer reported failure"],
+            ), []
+        findings = parser(execution.stdout, project)
+    except (ValueError, TypeError) as exc:
+        status = "invalid_output" if execution.success else "failed"
+        return AnalyzerRun(tool=tool, target=target, status=status, execution=execution,
+                           diagnostics=[str(exc), execution.stderr or execution.stdout]), []
+    # A signal/crash must not be masked by an earlier successful JSON document.
+    if execution.exit_code not in (0, 1, 255):
+        return AnalyzerRun(tool=tool, target=target, status="failed", execution=execution,
+                           diagnostics=["Unexpected process exit after analyzer output"]), []
+    return AnalyzerRun(tool=tool, target=target, status="completed", execution=execution,
+                       finding_count=len(findings)), findings
+
+
+def run_scout_tools(project: Path, runner: ControlledRunner, *, mythril_timeout: int = 60,
+                    transaction_count: int = 2, solc_binary: Path | None = None,
+                    mythril_binary: Path | None = None,
+                    mythril_max_sources: int = 10,
+                    demo_fallback: bool = False) -> AnalysisBundle:
+    """Run Slither plus bounded Mythril analysis without unbounded corpus runtimes."""
+    project = project.resolve()
+    paths, profile = project_sources(project)
+    # Slither follows imports and will otherwise report hundreds of issues in vendored
+    # libraries.  Keep the audit focused on the target project's configured source
+    # directory; callers can scan a dependency as its own Foundry project when needed.
+    configured_source = (project / profile.get("src", "src")).resolve()
+
+    def is_project_source(finding: VulnerabilityFinding) -> bool:
+        if not finding.file:
+            return False
+        candidate = (project / finding.file).resolve()
+        return candidate == configured_source or configured_source in candidate.parents
+
+    bundle = AnalysisBundle()
+    run, findings = _analyze("slither", ".", ["slither", ".", "--json", "-"], project, runner, parse_slither)
+    findings = [finding for finding in findings if is_project_source(finding)]
+    # The report describes the target-project findings, rather than the scanner's
+    # raw total which also includes imported third-party dependencies.
+    run.finding_count = len(findings)
+    bundle.runs.append(run)
+    bundle.findings.extend(findings)
+    # Keep compiler settings/remappings aligned with the default Foundry profile.
+    remappings = list(profile.get("remappings", []))
+    remapping_file = project / "remappings.txt"
+    if remapping_file.is_file():
+        remappings.extend(line.strip() for line in remapping_file.read_text().splitlines()
+                          if line.strip() and not line.lstrip().startswith("#"))
+    with tempfile.TemporaryDirectory(prefix="sentinel-solc-") as temp:
+        settings_file = Path(temp) / "settings.json"
+        solc_settings = {"remappings": remappings}
+        if "optimizer" in profile:
+            solc_settings["optimizer"] = {"enabled": bool(profile["optimizer"]), "runs": profile.get("optimizer_runs", 200)}
+        if "evm_version" in profile:
+            solc_settings["evmVersion"] = profile["evm_version"]
+        if "via_ir" in profile:
+            solc_settings["viaIR"] = bool(profile["via_ir"])
+        settings_file.write_text(json.dumps(solc_settings), encoding="utf-8")
+        selected_paths = paths[:mythril_max_sources]
+        for path in selected_paths:
+            myth_command = str(mythril_binary.resolve()) if mythril_binary and mythril_binary.is_file() else "myth"
+            command = [myth_command, "analyze", str(path), "-o", "json", "--no-onchain-data",
+                       "--execution-timeout", str(mythril_timeout),
+                       "--transaction-count", str(transaction_count), "--solc-json", str(settings_file)]
+            version = profile.get("solc_version", profile.get("solc"))
+            myth_env = {"MYTHRIL_DIR": str(Path(temp) / "mythril")}
+            has_configured_solc = bool(solc_binary and solc_binary.is_file())
+            if has_configured_solc:
+                myth_env["SOLC"] = str(solc_binary.resolve())
+            if not has_configured_solc and isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
+                command.extend(["--solv", version])
+            run, findings = _analyze("mythril", path.relative_to(project).as_posix(), command,
+                                     project, runner, parse_mythril, myth_env)
+            bundle.runs.append(run)
+            bundle.findings.extend(findings)
+            if run.status == "unavailable":
+                bundle.runs.append(AnalyzerRun(tool="mythril", target="remaining sources", status="skipped",
+                                               diagnostics=["Mythril unavailable; remaining source files were not analyzed"]))
+                break
+        if len(paths) > len(selected_paths):
+            bundle.runs.append(AnalyzerRun(
+                tool="mythril", target="remaining sources", status="skipped",
+                diagnostics=[f"Mythril source limit is {mythril_max_sources}; {len(paths) - len(selected_paths)} source file(s) were not analyzed"],
             ))
-    if not findings:
-        for name in sorted(path.name for path in (project / "src").glob("*.sol")) if (project / "src").exists() else []:
-            source = (project / "src" / name).read_text(encoding="utf-8")
-            if ".call{" in source or "call{value:" in source:
-                findings.append(VulnerabilityFinding(
-                    id="heuristic-reentrancy", source="local-heuristic", detector="external-call-order",
-                    severity="high", confidence="medium", file=f"src/{name}",
-                    description="External value transfer occurs before the balance effect is applied.",
-                    evidence=["external call precedes state update"], raw_output="",
-                ))
-            if "function sweep" in source and "owner" in source and "msg.sender" not in source.split("function sweep", 1)[1].split("}", 1)[0]:
-                findings.append(VulnerabilityFinding(
-                    id="heuristic-access-control", source="local-heuristic", detector="missing-authorization",
-                    severity="critical", confidence="medium", file=f"src/{name}",
-                    description="A sensitive sweep function has no caller authorization check.",
-                    evidence=["sweep transfers all funds without checking msg.sender"], raw_output="",
-                ))
-    return results[0], results[1], findings
+    if not paths:
+        bundle.runs.append(AnalyzerRun(tool="mythril", target=".", status="skipped",
+                                       diagnostics=["No Solidity source files found"]))
+    # Mock mode is an explicitly labeled deterministic fixture workflow. Keep its
+    # reviewed hint even when installed analyzers also produce unrelated candidates.
+    if demo_fallback:
+        bundle.findings.extend(_demo_findings(project, paths))
+    bundle.findings = rank_and_deduplicate(bundle.findings)
+    return bundle
+
+
+def _demo_findings(project: Path, paths: list[Path]) -> list[VulnerabilityFinding]:
+    """Explicit demo-only hints retained for the existing example workflow."""
+    findings = []
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        call = source.find(".call{")
+        effect = source.find("balances[msg.sender] = 0;")
+        if (path.name in {"Vault.sol", "VulnerableVault.sol"} or "// reentrancy demo" in source) and call >= 0 and effect > call:
+            findings.append(VulnerabilityFinding(
+                id="heuristic-reentrancy", source="local-heuristic", sources=["local-heuristic"],
+                detector="external-call-order", severity="high", confidence="low", confidence_score=0.3,
+                file=path.relative_to(project).as_posix(), line=source[:call].count("\n") + 1,
+                description="Demo heuristic: external call before balance update; requires validation.",
+                evidence=["Demo-only lexical pattern; not a Slither or Mythril result"],
+            ))
+        if "function sweep" in source and "owner" in source and "msg.sender" not in source.split("function sweep", 1)[1].split("}", 1)[0]:
+            findings.append(VulnerabilityFinding(
+                id="heuristic-access-control", source="local-heuristic", sources=["local-heuristic"],
+                detector="missing-authorization", severity="critical", confidence="low", confidence_score=0.3,
+                file=path.relative_to(project).as_posix(), description="Demo heuristic: sweep lacks a caller check.",
+                evidence=["Demo-only lexical pattern; not a Slither or Mythril result"],
+            ))
+        if "tx.origin" in source:
+            findings.append(VulnerabilityFinding(
+                id="heuristic-tx-origin", source="local-heuristic", sources=["local-heuristic"],
+                detector="tx-origin-authentication", severity="high", confidence="low", confidence_score=0.3,
+                file=path.relative_to(project).as_posix(), line=source[:source.find("tx.origin")].count("\n") + 1,
+                description="Demo heuristic: authorization uses tx.origin instead of msg.sender.",
+                evidence=["Demo-only lexical pattern; not a Slither or Mythril result"],
+            ))
+        if ".call{" in source and "unchecked low-level call" in source:
+            call = source.find(".call{")
+            findings.append(VulnerabilityFinding(
+                id="heuristic-unchecked-call", source="local-heuristic", sources=["local-heuristic"],
+                detector="unchecked-low-level-call", severity="medium", confidence="low", confidence_score=0.3,
+                file=path.relative_to(project).as_posix(), line=source[:call].count("\n") + 1,
+                description="Demo heuristic: low-level call result is ignored.",
+                evidence=["Demo-only lexical pattern; not a Slither or Mythril result"],
+            ))
+    return findings
 
 
 def extract_solidity_context(project: Path) -> tuple[list[str], dict[str, str], dict[str, object]]:
-    source_files = sorted(str(path.relative_to(project)) for path in (project / "src").rglob("*.sol")) if (project / "src").exists() else []
+    project = project.resolve()
+    paths, _ = project_sources(project)
+    source_files = [path.relative_to(project).as_posix() for path in paths]
     original = {name: (project / name).read_text(encoding="utf-8") for name in source_files}
     context = {"contracts": [], "functions": [], "state_variables": [], "source_locations": []}
     for source in original.values():

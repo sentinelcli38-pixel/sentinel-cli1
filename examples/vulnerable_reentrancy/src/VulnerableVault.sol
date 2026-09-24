@@ -10,7 +10,7 @@ contract VulnerableVault {
 
     function withdraw() external {
         uint256 amount = balances[msg.sender];
-        (bool sent,) = msg.sender.call{value: amount}("");
+        (bool sent,) = msg.sender.call{value: amount}(""); // reentrancy demo
         require(sent, "send failed");
         balances[msg.sender] = 0;
     }

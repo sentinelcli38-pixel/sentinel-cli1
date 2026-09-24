@@ -1,11 +1,13 @@
+import os
+import re
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from sentinel.schemas.execution import ExecutionResult
 
-ALLOWED_COMMANDS = frozenset({"solc", "slither", "aderyn", "forge", "cast", "docker"})
+ALLOWED_COMMANDS = frozenset({"solc", "slither", "myth", "aderyn", "forge", "cast", "docker"})
 
 
 class ControlledRunner:
@@ -14,16 +16,21 @@ class ControlledRunner:
     def __init__(self, timeout_seconds: int = 120) -> None:
         self.timeout_seconds = timeout_seconds
 
-    def run(self, command: Sequence[str], cwd: Path) -> ExecutionResult:
-        if not command or Path(command[0]).name not in ALLOWED_COMMANDS:
+    def run(self, command: Sequence[str], cwd: Path, env: Mapping[str, str] | None = None) -> ExecutionResult:
+        executable = Path(command[0]).name if command else ""
+        allowed_versioned_solc = re.fullmatch(r"solc-\d+\.\d+\.\d+", executable)
+        if not command or (executable not in ALLOWED_COMMANDS and not allowed_versioned_solc):
             raise ValueError(f"Command is not allowlisted: {command!r}")
         cwd = cwd.resolve()
         if not cwd.is_dir():
             raise ValueError(f"Working directory does not exist: {cwd}")
+        if env is not None and set(env) - {"SOLC", "SOLC_VERSION", "MYTHRIL_DIR"}:
+            raise ValueError("Only compiler environment and Mythril workspace overrides are allowed")
         started = time.monotonic()
         try:
             completed = subprocess.run(
                 list(command), cwd=cwd, capture_output=True, text=True,
+                env={**os.environ, **(dict(env) if env else {})},
                 timeout=self.timeout_seconds, check=False,
             )
             return ExecutionResult(
@@ -35,8 +42,12 @@ class ControlledRunner:
         except subprocess.TimeoutExpired as exc:
             return ExecutionResult(
                 command=list(command), cwd=str(cwd), exit_code=None,
-                stdout=exc.stdout or "", stderr=exc.stderr or "",
+                stdout=_decode(exc.stdout), stderr=_decode(exc.stderr),
                 duration_seconds=time.monotonic() - started, timed_out=True,
             )
         except OSError as exc:
             return ExecutionResult.failed(list(command), str(cwd), str(exc))
+
+
+def _decode(value: str | bytes | None) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""

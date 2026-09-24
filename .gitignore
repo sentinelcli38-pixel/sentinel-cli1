@@ -7,3 +7,7 @@ reports/*.md
 reports/*.json
 out/
 cache/
+datasets/*
+!datasets/.gitkeep
+!datasets/manifests/
+!datasets/manifests/.gitkeep

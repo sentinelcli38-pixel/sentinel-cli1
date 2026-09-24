@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field
 
+from sentinel.schemas.analysis import AnalyzerRun
 from sentinel.schemas.artifacts import ExploitArtifact, PatchArtifact
 from sentinel.schemas.execution import ExecutionResult, JudgeResult
 from sentinel.schemas.vulnerability import VulnerabilityFinding
@@ -17,6 +18,7 @@ class RuntimeState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=False)
 
     project_path: str
+    workspace_path: str | None = None
     mock_mode: bool = False
     max_retries: int = 5
     source_files: list[str] = Field(default_factory=list)
@@ -24,6 +26,9 @@ class RuntimeState(BaseModel):
     ast_context: dict[str, object] = Field(default_factory=dict)
     natspec_context: dict[str, str] = Field(default_factory=dict)
     slither_result: ExecutionResult | None = None
+    mythril_results: list[ExecutionResult] = Field(default_factory=list)
+    analyzer_runs: list[AnalyzerRun] = Field(default_factory=list)
+    scout_only: bool = False
     aderyn_result: ExecutionResult | None = None
     findings: list[VulnerabilityFinding] = Field(default_factory=list)
     scout_results: list[str] = Field(default_factory=list)
@@ -45,6 +50,7 @@ class RuntimeState(BaseModel):
     feedback: list[str] = Field(default_factory=list)
     final_verification_state: str = "not_started"
     final_report_path: str | None = None
+    report_artifacts: list[str] = Field(default_factory=list)
 
     def json_ledger(self) -> str:
         return self.model_dump_json(indent=2)
